@@ -1161,14 +1161,10 @@ def run_command(command, **kwargs):
         # tree handling matches the original main(): func returns the tree dict.
         if command == "tree" and code is not None:
             tree = code
-            fmt = args.format
-            rendered = []
-            if fmt in ("json", "both"):
-                rendered.append(json.dumps(tree, indent=2, default=str))
-            if fmt in ("tree", "md", "both"):
-                rendered.append(snap.render_markdown(tree))
-            if rendered:
-                output = "\n".join(rendered) + "\n"
+            if args.format == "json":
+                output = json.dumps(tree, indent=2, default=str) + "\n"
+            else:  # tree, md
+                output = snap.render_markdown(tree)
 
         result["ok"] = True
         result["output"] = output

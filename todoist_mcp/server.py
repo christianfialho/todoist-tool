@@ -38,7 +38,7 @@ class Server(MCPServer):
             ),
         )
 
-        @self.tool(name="todoist", description=(
+        @self.tool(name="todoist", structured_output=False, description=(
             "Run a Todoist command. `command` selects the operation; the other "
             "options are the command's arguments. Returns JSON of the form "
             "{ok:true, cmd, output} on success, {ok:false, cmd, error} on "
@@ -56,7 +56,7 @@ class Server(MCPServer):
             due: Optional[Literal["all", "today", "this-week", "overdue",
                                   "no-date", "any-date"]] = None,
             priority: Optional[Literal["p1", "p2", "p3", "p4"]] = None,
-            format: Optional[Literal["tree", "md", "json", "both"]] = None,
+            format: Optional[Literal["tree", "md", "json"]] = None,
             text: Optional[str] = None,
             task: Optional[str] = None,
             content: Optional[str] = None,

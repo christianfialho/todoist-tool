@@ -38,9 +38,8 @@ def _build_parser():
                    help="all=no filter, today, this-week, overdue, no-date, any-date. Default: all")
     p.add_argument("--priority", choices=["p1", "p2", "p3", "p4"] or None, default=None,
                    help="Only tasks at user-facing priority P1..P4 (p1 highest).")
-    p.add_argument("--format", choices=["tree", "md", "json", "both"], default="tree",
-                   help="tree=ASCII hierarchy, md=markdown for chat, json=machine-readable, "
-                        "both=json then md. Default: tree")
+    p.add_argument("--format", choices=["tree", "md", "json"], default="tree",
+                   help="tree=ASCII hierarchy, md=markdown for chat, json=machine-readable. Default: tree")
     p.set_defaults(func=core.cmd_tree)
 
     sub.add_parser("projects", help="List projects with id + open task count.").set_defaults(func=core.cmd_projects)
