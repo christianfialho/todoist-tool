@@ -1,0 +1,11 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local config/state that must never be committed
+.env
+.env.*
+todoist_reports/
+*.state
+todoist_ops.log
