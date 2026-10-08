@@ -1,30 +1,29 @@
 # todoist-tool
 
-A Todoist integration for people who use Todoist through both a terminal and
-an MCP-capable AI agent. One core library (`todoist/core.py`) drives two
-front-ends — a thin CLI and a stdio MCP server — with a single shared
-dispatcher (`run_command`), a shared JSONL operation log, and full undo.
+I use Todoist from two places, a terminal and an MCP-capable AI agent, and I
+wanted both to hit the same core: one library (`todoist/core.py`) with a thin
+CLI on one side and a stdio MCP server on the other, a shared JSONL operation
+log, and undo everywhere.
 
 ## Why
 
-The Todoist web/API surface is flat: everything is project-scoped, there is no
-hierarchy view, and destructive operations are one-way. This tool adds the
-layer that's missing:
+The Todoist web/API surface is flat. Everything is project-scoped, there's no
+hierarchy view, and destructive operations are one-way. So this tool adds:
 
-- **Whole-hierarchy views** — `tree` renders project → section → parent →
-  subtask in one call, instead of N API round-trips.
-- **An audit + undo log** — every mutating operation is appended to a JSONL
-  op log; `undo` reverses the last operation (and `ops` shows the audit
-  trail). Completes are reopened, renames are reversed, buckets are restored.
-- **Buckets (project lifecycle)** — a "bucket" is an outcome you work inside
-  (a paper, a client, a trip). Bucket commands map onto Todoist project
-  objects via rename-only lifecycle management with a fixed reserve of spare
-  slots, so the account's project object count never changes; the slot
-  mechanics stay invisible to the caller.
-- **A rate-limit gate with memory** — an in-process gate tracks 429 strikes,
-  backs off, and survives restarts via a small on-disk state file, plus a
-  short-TTL sync snapshot cache so repeated agent calls don't re-fetch the
-  whole account.
+- `tree`, which renders project → section → parent → subtask in one call
+  instead of N API round-trips.
+- An op log and undo. Every mutating operation is appended to a JSONL file;
+  `undo` reverses the last one (completes get reopened, renames reversed,
+  buckets restored) and `ops` shows the audit trail.
+- Buckets. A bucket is an outcome you work inside (a paper, a client, a trip),
+  and bucket commands map onto Todoist project objects through rename-only
+  lifecycle management with a fixed reserve of spare slots. The account's
+  project count never changes and the slot bookkeeping stays invisible; see
+  the invariant section below, and the tests that enforce it.
+- A rate-limit gate with memory. An in-process gate tracks 429s and backs
+  off, and a small on-disk state file keeps that memory across restarts.
+  There's also a short-TTL sync snapshot cache so an agent asking three
+  questions in a row doesn't re-fetch the whole account each time.
 
 ## Layout
 
@@ -103,10 +102,10 @@ status). Both return plain JSON in a single text payload.
 
 ## Bucket invariant
 
-The design invariant (and what the tests enforce): bucket commands **never**
-create, delete, or archive a project object. They only rename between a
-`Spare Project N` marker and a live outcome name, so the object count is
-immutable and every transition is a rename — which `undo` can always reverse.
+The rule the tests enforce: bucket commands never create, delete, or archive a
+project object. They only rename between a `Spare Project N` marker and a live
+outcome name, so the object count is immutable and every transition is a
+rename, which means `undo` can always reverse it.
 
 ## Tests
 
