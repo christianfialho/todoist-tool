@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """Todoist core — the full Todoist integration layer (MCP refactor).
 
-Everything that used to live in ``~/.hermes/profiles/christian/scripts/
-todoist_layer.py`` was lifted here verbatim (v1 API base, sync snapshot,
-hierarchy/render/filter logic, all ``cmd_*`` handlers, the JSONL op/undo log,
-report plugins, the argparse surface). Two deliberate seams were added:
+The integration layer was lifted verbatim from an earlier single-file script
+(v1 API base, sync snapshot, hierarchy/render/filter logic, all ``cmd_*``
+handlers, the JSONL op/undo log, report plugins, the argparse surface). Two
+deliberate seams were added:
 
   * ``ToolError`` replaces ``sys.exit(...)`` so errors propagate cleanly
     instead of killing the process (an MCP server must never exit).
@@ -24,6 +24,7 @@ import datetime as _dt
 import io
 import json
 import os
+import re
 import sys
 import time
 import urllib.error
@@ -33,16 +34,28 @@ from types import SimpleNamespace as _NS
 
 
 # ── Configuration ───────────────────────────────────────────────────────────
-ENV_PATH = "/home/fialho/.hermes/profiles/christian/.env"
+# Token file. Resolution order:
+#   1. $TODOIST_ENV_FILE (explicit override)
+#   2. $XDG_CONFIG_HOME/todoist-tool/.env (default ~/.config/todoist-tool/.env)
+_env_file = os.environ.get("TODOIST_ENV_FILE")
+if not _env_file:
+    _xdg_config = os.environ.get("XDG_CONFIG_HOME",
+                                 os.path.expanduser("~/.config"))
+    _env_file = os.path.join(_xdg_config, "todoist-tool", ".env")
+ENV_PATH = _env_file
 TOKEN_VARS = ("TODOIST_API_KEY", "TODOIST_API_TOKEN")
 BASE = "https://api.todoist.com/api/v1"
 SYNC_RESOURCES = [
     "projects", "sections", "items", "notes", "project_notes",
     "labels", "user",
 ]
-_CHRISTIAN_SCRIPTS = os.path.dirname(ENV_PATH)
-REPORTS_DIR = os.path.join(
-    os.environ.get("TODOIST_REPORTS_DIR", _CHRISTIAN_SCRIPTS), "todoist_reports")
+# State/reports root. Resolution order:
+#   1. $TODOIST_STATE_HOME (default ~/.local/state/todoist-tool)
+#   2. $TODOIST_REPORTS_DIR / $TODOIST_OP_LOG for finer overrides.
+_STATE_HOME = os.environ.get("TODOIST_STATE_HOME",
+                             os.path.expanduser("~/.local/state/todoist-tool"))
+REPORTS_DIR = os.environ.get(
+    "TODOIST_REPORTS_DIR", os.path.join(_STATE_HOME, "todoist_reports"))
 
 # Priority: in the v1 API 4 = P1 (very urgent) and 1 = P4 (natural); clients
 # display P1..P4.
@@ -58,9 +71,15 @@ DEFAULT_STATE_FILE = os.environ.get(
     os.path.join(_HERE, ".ratelimit.json"))
 DEFAULT_SYNC_TTL = float(os.environ.get("TODOIST_SYNC_TTL", "5.0"))
 
-# The historic op log / reports stayed at the christian scripts path.
-OP_LOG = os.path.join(os.environ.get("TODOIST_OP_LOG",
-    os.path.dirname(ENV_PATH)), "todoist_ops.jsonl")
+OP_LOG = os.path.join(os.environ.get("TODOIST_OP_LOG", _STATE_HOME),
+                      "todoist_ops.jsonl")
+
+# A project whose name matches this marker is a FREE slot held in reserve.
+# The marker name is the only source of truth for the spare pool (no side
+# file). Bucket commands never create/delete/archive a project — they rename
+# between a spare marker and a live outcome name, so the slot count never
+# changes.
+SPARE_RE = re.compile(r"^Spare Project (\d+)$", re.IGNORECASE)
 
 
 # ── errors ──────────────────────────────────────────────────────────────────
@@ -441,9 +460,9 @@ class Todoist:
             return cands[0]
         if len(cands) > 1:
             raise ValueError(
-                "ambiguous project %r -> %s" % (query,
-                                                [self.projects[c]["name"] for c in cands]))
-        raise ValueError("unknown project %r. Known: %s" % (
+                "ambiguous bucket %r -> %s" % (query,
+                                               [self.projects[c]["name"] for c in cands]))
+        raise ValueError("unknown bucket %r. Known: %s" % (
             query, sorted(p["name"] for p in self.projects.values()
                           if not p.get("is_deleted"))))
 
@@ -765,12 +784,17 @@ def cmd_search(snap, args):
     return 0
 
 
-def cmd_projects(snap, _a):
+def cmd_bucket_list(snap, _a):
+    """List every bucket (project) with id, open-task count, and any spare
+    marker. `list` is the bucket-tool name; `projects` remains an alias."""
     for proj in sorted(snap.projects.values(), key=lambda x: str(x.get("name", ""))):
         n = sum(1 for t in snap.items.values()
                 if t.get("project_id") == proj["id"] and snap.is_open(t))
         flag = " [inbox]" if proj.get("inbox_project") else ""
         flag += " [archived]" if proj.get("is_archived") else ""
+        m = SPARE_RE.match(proj.get("name", ""))
+        if m:
+            flag += f" [spare#{m.group(1)}]"
         print(f"{proj['name']}\t{proj['id']}\topen={n}{flag}")
     return 0
 
@@ -937,6 +961,125 @@ def cmd_delete_comment(snap, args):
     return 0
 
 
+# ── bucket (project/outcome) commands ──────────────────────────────────────
+# These are the ONLY commands that manage the scarce, non-renewable project
+# slot pool. Safety invariant (test-enforced): they only ever emit project
+# RENAMEs (POST /projects/{id} with is_archived:false) plus task close/reopen
+# for release — never DELETE /projects, never is_archived:true, never
+# POST /projects (create). The pool is derived purely from spare-name markers.
+
+def _spare_buckets(snap):
+    """[(spare_no, project)] for every non-deleted spare-marker bucket."""
+    out = []
+    for p in snap.projects.values():
+        if p.get("is_deleted"):
+            continue
+        m = SPARE_RE.match(p.get("name", ""))
+        if m:
+            out.append((int(m.group(1)), p))
+    return out
+
+
+def _live_buckets(snap):
+    """Non-deleted, non-archived buckets that are not the inbox and not spares."""
+    return [p for p in snap.projects.values()
+            if not p.get("is_deleted") and not p.get("is_archived")
+            and not p.get("inbox_project") and not SPARE_RE.match(p.get("name", ""))]
+
+
+def _next_spare_no(snap):
+    used = {n for n, _ in _spare_buckets(snap)}
+    n = 1
+    while n in used:
+        n += 1
+    return n
+
+
+def cmd_bucket_create(snap, args):
+    name = (args.name or "").strip()
+    if not name:
+        raise ToolError("error: 'name' is required")
+    if SPARE_RE.match(name):
+        raise ToolError(f"error: {name!r} is a reserved spare name")
+    spares = sorted(_spare_buckets(snap), key=lambda t: t[0])
+    if not spares:
+        raise ToolError("error: no spare buckets available (slot pool exhausted). "
+                        "Release a completed bucket first to free a slot.")
+    spare_no, spare = spares[0]
+    tasks = [t for t in snap.items.values()
+             if t.get("project_id") == spare["id"] and snap.is_open(t)]
+    if tasks:
+        raise ToolError(f"error: spare {spare['name']} still holds {len(tasks)} open "
+                        "task(s). Empty it first (release/move them).")
+    prev_name = spare["name"]
+    _http("POST", f"/projects/{spare['id']}", {"is_archived": False, "name": name})
+    _log_op({"action": "bucket-create", "bucket_id": spare["id"],
+             "prev_name": prev_name, "new_name": name, "name": name,
+             "spare_no": spare_no,
+             "prev": {"name": prev_name}, "new": {"name": name}})
+    print(json.dumps({"created": True, "bucket": name, "id": spare["id"]}, indent=2))
+    return 0
+
+
+def cmd_bucket_rename(snap, args):
+    bucket = (args.bucket or "").strip()
+    name = (args.name or "").strip()
+    if not bucket or not name:
+        raise ToolError("error: 'bucket' (current name) and 'name' are both required")
+    if SPARE_RE.match(name):
+        raise ToolError(f"error: {name!r} is a reserved spare name")
+    pid = snap.resolve_project(bucket)
+    prev = snap.projects[pid]["name"]
+    _http("POST", f"/projects/{pid}", {"is_archived": False, "name": name})
+    _log_op({"action": "bucket-rename", "bucket_id": pid,
+             "prev_name": prev, "new_name": name, "name": name,
+             "prev": {"name": prev}, "new": {"name": name}})
+    print(json.dumps({"renamed": True, "bucket": name, "id": pid}, indent=2))
+    return 0
+
+
+def cmd_bucket_release(snap, args):
+    name = (args.name or "").strip()
+    if not name:
+        raise ToolError("error: 'name' is required to release a bucket")
+    pid = snap.resolve_project(name)
+    proj = snap.projects[pid]
+    if proj.get("inbox_project"):
+        raise ToolError("error: cannot release the Inbox bucket")
+    spare_no = _next_spare_no(snap)
+    spare_name = f"Spare Project {spare_no}"
+    open_tasks = [t for t in snap.items.values()
+                  if t.get("project_id") == pid and snap.is_open(t)]
+    closed = []
+    for t in open_tasks:
+        _http("POST", f"/tasks/{t['id']}/close", {})
+        closed.append({"id": t["id"], "content": t.get("content")})
+    prev_name = proj["name"]
+    _http("POST", f"/projects/{pid}", {"is_archived": False, "name": spare_name})
+    _log_op({"action": "bucket-release", "bucket_id": pid,
+             "prev_name": prev_name, "new_name": spare_name, "name": prev_name,
+             "spare_no": spare_no, "closed_tasks": closed,
+             "prev": {"name": prev_name},
+             "new": {"name": spare_name, "closed_tasks": closed}})
+    print(json.dumps({"released": True, "bucket": prev_name, "now": spare_name,
+                      "id": pid, "tasks_closed": len(closed)}, indent=2))
+    return 0
+
+
+def cmd_bucket_status(snap, _a):
+    spares = sorted(n for n, _ in _spare_buckets(snap))
+    print(json.dumps({
+        "inbox": next((p["name"] for p in snap.projects.values()
+                       if p.get("inbox_project") and not p.get("is_deleted")), None),
+        "live": [p["name"] for p in _live_buckets(snap)],
+        "live_count": len(_live_buckets(snap)),
+        "spares": spares,
+        "spare_count": len(spares),
+        "spare_names": [p["name"] for n, p in sorted(_spare_buckets(snap))],
+    }, indent=2))
+    return 0
+
+
 # ── undo (reverse an op from the log) ───────────────────────────────────────
 def _undo_add(snap, rec):
     _http("POST", f"/tasks/{rec['task_id']}/close", {})   # add -> complete
@@ -1019,6 +1162,38 @@ def _undo_delete_comment(snap, rec):
         raise ToolError("error: comment content not logged; cannot recreate")
 
 
+def _undo_bucket_create(snap, rec):
+    # Rename the created bucket back to its spare marker (spare_no reused).
+    spare_no = rec.get("spare_no") or _next_spare_no(snap)
+    new_name = f"Spare Project {spare_no}"
+    if not SPARE_RE.match(rec.get("prev_name", "")):
+        # safety: never rename away from a spare; keep the original marker
+        new_name = rec.get("prev_name") or new_name
+    _http("POST", f"/projects/{rec['bucket_id']}",
+          {"is_archived": False, "name": new_name})
+
+
+def _undo_bucket_rename(snap, rec):
+    _http("POST", f"/projects/{rec['bucket_id']}",
+          {"is_archived": False, "name": rec.get("prev_name") or rec.get("name")})
+
+
+def _undo_bucket_release(snap, rec):
+    # Reopen every task that release closed, then rename back to the prior
+    # live bucket name. Order matters: reopen first so the rename target
+    # bucket is the name users expect.
+    for t in rec.get("closed_tasks", []):
+        try:
+            _http("POST", f"/tasks/{t['id']}/reopen", {})
+        except ToolError:
+            pass  # a task may have been completed/deleted since; skip it
+    new_name = rec.get("prev_name")
+    if not new_name or SPARE_RE.match(str(new_name)):
+        new_name = f"Spare Project {rec.get('spare_no') or _next_spare_no(snap)}"
+    _http("POST", f"/projects/{rec['bucket_id']}",
+          {"is_archived": False, "name": new_name})
+
+
 UNDO_ACTIONS = {
     "add": _undo_add,
     "complete": _undo_complete,
@@ -1028,6 +1203,9 @@ UNDO_ACTIONS = {
     "update": _undo_update,
     "comment": _undo_comment,
     "delete-comment": _undo_delete_comment,
+    "bucket-create": _undo_bucket_create,
+    "bucket-rename": _undo_bucket_rename,
+    "bucket-release": _undo_bucket_release,
 }
 
 
@@ -1086,16 +1264,21 @@ def cmd_report(snap, args):
 # ── dispatcher: parse kwargs -> Namespace, run like the original main() ─────
 def _args(command, kw):
     g = kw.get
+    # user-facing arg is `bucket`; accept `project` as a hidden alias so old
+    # call sites (and the CLI's --project muscle memory) keep working.
+    _bucket = g("bucket", g("project", ""))
     if command == "tree":
         return _NS(label=g("label", ""), status=g("status", "open"),
                    due=g("due", "all"), priority=g("priority", ""),
-                   project=g("project", ""), format=g("format", "tree"))
+                   project=_bucket, format=g("format", "tree"))
     if command == "search":
         return _NS(text=g("text", ""), json=bool(g("json", False)))
-    if command in ("projects", "labels"):
+    if command in ("projects", "list"):
+        return _NS()
+    if command == "labels":
         return _NS()
     if command == "add":
-        return _NS(content=g("content", ""), project=g("project", ""),
+        return _NS(content=g("content", ""), project=_bucket,
                    section=g("section", ""), parent=g("parent", ""),
                    due=g("due", ""), deadline=g("deadline", ""),
                    priority=g("priority", "p4"), labels=g("labels", ""),
@@ -1103,7 +1286,7 @@ def _args(command, kw):
     if command in ("complete", "reopen", "delete"):
         return _NS(task=g("task", ""))
     if command == "move":
-        return _NS(task=g("task", ""), project=g("project", ""),
+        return _NS(task=g("task", ""), project=_bucket,
                    section=g("section", ""), parent=g("parent", ""))
     if command == "update":
         return _NS(task=g("task", ""), content=g("content", ""),
@@ -1121,15 +1304,26 @@ def _args(command, kw):
     if command == "report":
         return _NS(report=g("report", ""), arg=list(g("arg", []) or []),
                    json=bool(g("json", False)))
+    if command == "create":
+        return _NS(name=g("name", ""))
+    if command == "rename":
+        return _NS(bucket=_bucket, name=g("name", ""))
+    if command == "release":
+        return _NS(name=g("name", ""))
+    if command == "status":
+        return _NS()
     raise ToolError(f"unknown command {command!r}")
 
 
 _COMMAND_FUNCS = {
-    "tree": cmd_tree, "projects": cmd_projects, "labels": cmd_labels,
-    "search": cmd_search, "add": cmd_add, "complete": cmd_complete,
-    "reopen": cmd_reopen, "delete": cmd_delete, "move": cmd_move,
-    "update": cmd_update, "comment": cmd_comment, "delete-comment": cmd_delete_comment,
-    "undo": cmd_undo, "ops": cmd_ops, "report": cmd_report,
+    "tree": cmd_tree, "projects": cmd_bucket_list, "list": cmd_bucket_list,
+    "labels": cmd_labels, "search": cmd_search, "add": cmd_add,
+    "complete": cmd_complete, "reopen": cmd_reopen, "delete": cmd_delete,
+    "move": cmd_move, "update": cmd_update, "comment": cmd_comment,
+    "delete-comment": cmd_delete_comment, "undo": cmd_undo, "ops": cmd_ops,
+    "report": cmd_report,
+    "create": cmd_bucket_create, "rename": cmd_bucket_rename,
+    "release": cmd_bucket_release, "status": cmd_bucket_status,
 }
 
 FORMAT_ALIASES = {}  # the `compact` alias was deliberately rejected; see cli.

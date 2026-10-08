@@ -7,8 +7,8 @@ faithful port of the original ``todoist_layer.py`` CLI, with added ``help=``
 strings on ``--format``/``--status``/``--due``/``--priority`` so ``-h`` can
 explain the accepted values.
 
-Runs identically via ``python3 todoist/cli.py ...`` or through the historical
-shim at ``~/.hermes/profiles/christian/scripts/todoist_layer.py``.
+Runs identically via ``python3 todoist/cli.py ...`` or through any shim that
+forwards to it.
 """
 
 import argparse
@@ -29,7 +29,8 @@ def _build_parser():
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("tree", help="Print the full project -> section -> parent -> subtask tree.")
-    p.add_argument("--project", help="Project name or id (default: all active projects).")
+    p.add_argument("--bucket", "--project", dest="bucket", default="",
+                   help="Bucket (project/outcome) name or id (default: all active).")
     p.add_argument("--label", help="Only tasks carrying this label (e.g. @waiting).")
     p.add_argument("--status", choices=["open", "all", "done"], default="open",
                    help="open=not checked, all=everything, done=checked. Default: open")
@@ -42,7 +43,7 @@ def _build_parser():
                    help="tree=ASCII hierarchy, md=markdown for chat, json=machine-readable. Default: tree")
     p.set_defaults(func=core.cmd_tree)
 
-    sub.add_parser("projects", help="List projects with id + open task count.").set_defaults(func=core.cmd_projects)
+    sub.add_parser("list", aliases=["projects"], help="List buckets (projects/outcomes) with id + open task count.").set_defaults(func=core.cmd_bucket_list)
     sub.add_parser("labels", help="List labels with id + color.").set_defaults(func=core.cmd_labels)
 
     s = sub.add_parser("search", help="Search open/closed task text.")
@@ -52,7 +53,8 @@ def _build_parser():
 
     w = sub.add_parser("add", help="Create a task.")
     w.add_argument("--content", required=True)
-    w.add_argument("--project", help="Project name/id (default: Inbox).")
+    w.add_argument("--bucket", "--project", dest="bucket", default="",
+                   help="Bucket (project/outcome) name/id (default: Inbox).")
     w.add_argument("--section", help="Section name within the project.")
     w.add_argument("--parent", help="Parent task id or substring to nest under.")
     w.add_argument("--due", help="Due string, e.g. 'next Monday' or '2026-10-01'.")
@@ -76,7 +78,7 @@ def _build_parser():
 
     m = sub.add_parser("move", help="Move a task to a project/section/parent.")
     m.add_argument("--task", required=True)
-    m.add_argument("--project", required=True)
+    m.add_argument("--bucket", "--project", dest="bucket", required=True)
     m.add_argument("--section")
     m.add_argument("--parent")
     m.set_defaults(func=core.cmd_move)
@@ -108,6 +110,27 @@ def _build_parser():
     oo.add_argument("--last", type=int, default=20, help="Show only the last N ops.")
     oo.set_defaults(func=core.cmd_ops)
 
+    bc = sub.add_parser("create", aliases=["bucket-create"],
+                        help="Open a new outcome bucket, transparently reusing a free reserve slot (no project limit burn).")
+    bc.add_argument("--name", required=True, help="Name of the new bucket/outcome.")
+    bc.set_defaults(func=core.cmd_bucket_create)
+
+    br = sub.add_parser("rename", aliases=["bucket-rename"],
+                        help="Retitle an existing bucket/outcome.")
+    br.add_argument("--bucket", "--project", dest="bucket", required=True,
+                    help="Current bucket name/id to rename.")
+    br.add_argument("--name", required=True, help="New bucket name.")
+    br.set_defaults(func=core.cmd_bucket_rename)
+
+    rel = sub.add_parser("release", aliases=["bucket-release"],
+                         help="Close out a bucket's open tasks and return its slot to the free pool (undoable).")
+    rel.add_argument("name", help="Bucket name/id to release.")
+    rel.set_defaults(func=core.cmd_bucket_release)
+
+    st = sub.add_parser("status", aliases=["bucket-status"],
+                        help="Show live vs free-slot bucket counts.")
+    st.set_defaults(func=core.cmd_bucket_status)
+
     rep = sub.add_parser("report", help="Run an aggregation report plugin.")
     rep.add_argument("--report", required=True, help="Report name in todoist_reports/")
     rep.add_argument("--arg", action="append", default=[], help="key=value report args (repeatable).")
@@ -116,10 +139,21 @@ def _build_parser():
     return ap
 
 
+# argparse subparsers set `cmd` to whichever spelling was typed (canonical or
+# alias). Normalize alias spellings back to the canonical command name used by
+# core's dispatcher.
+_ALIAS_TO_CMD = {
+    "list": "list", "projects": "list",
+    "bucket-create": "create", "bucket-rename": "rename",
+    "bucket-release": "release", "bucket-status": "status",
+}
+
+
 def main(argv=None):
     ns = _build_parser().parse_args(argv)
+    cmd = _ALIAS_TO_CMD.get(ns.cmd, ns.cmd)
     kw = {k: v for k, v in vars(ns).items() if k not in ("cmd", "func")}
-    res = core.run_command(ns.cmd, **kw)
+    res = core.run_command(cmd, **kw)
     if res["ok"]:
         sys.stdout.write(res["output"])
         if res["output"] and not res["output"].endswith("\n"):
